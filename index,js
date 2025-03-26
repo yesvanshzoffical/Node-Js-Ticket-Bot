@@ -1,0 +1,648 @@
+require('dotenv').config();
+const { Client, Intents, MessageEmbed, MessageActionRow, MessageButton, MessageSelectMenu } = require('discord.js');
+const fs = require('fs');
+const path = require('path');
+
+// Configuration from .env
+const config = {
+  TOKEN: process.env.DISCORD_TOKEN,
+  TICKET_CATEGORY_ID: process.env.TICKET_CATEGORY_ID,
+  STAFF_ROLE_ID: process.env.STAFF_ROLE_ID,
+  GUILD_ID: process.env.GUILD_ID,
+  CHANNEL_ID: process.env.CHANNEL_ID,
+  LOG_CHANNEL_ID: process.env.LOG_CHANNEL_ID
+};
+
+// Constants
+const DATA_FILE = path.join(__dirname, 'data.json');
+const TICKET_CATEGORIES = {
+  billing: "Billing Support",
+  technical: "Technical Support",
+  general: "General Inquiry"
+};
+
+// Data management
+let data = {
+  tickets: {},
+  staff_ratings: {},
+  panel_message_id: null
+};
+
+function loadData() {
+  try {
+    if (fs.existsSync(DATA_FILE)) {
+      const fileData = fs.readFileSync(DATA_FILE, 'utf8');
+      data = JSON.parse(fileData);
+    }
+  } catch (error) {
+    console.error('Error loading data:', error);
+  }
+}
+
+function saveData() {
+  try {
+    fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2));
+  } catch (error) {
+    console.error('Error saving data:', error);
+  }
+}
+
+// Initialize bot
+const client = new Client({
+  intents: [
+    Intents.FLAGS.GUILDS,
+    Intents.FLAGS.GUILD_MESSAGES,
+    Intents.FLAGS.GUILD_MEMBERS,
+    Intents.FLAGS.GUILD_MESSAGE_REACTIONS
+  ]
+});
+
+// Cooldown system
+const cooldowns = new Map();
+
+// Create ticket channel
+async function createTicketChannel(interaction, category) {
+  try {
+    const guild = interaction.guild;
+    const creator = interaction.user;
+    const staffRole = await guild.roles.fetch(config.STAFF_ROLE_ID);
+
+    const overwrites = [
+      {
+        id: guild.id,
+        deny: ['VIEW_CHANNEL']
+      },
+      {
+        id: creator.id,
+        allow: ['VIEW_CHANNEL', 'SEND_MESSAGES']
+      },
+      {
+        id: staffRole.id,
+        allow: ['VIEW_CHANNEL', 'SEND_MESSAGES']
+      }
+    ];
+
+    const ticketCategory = await guild.channels.fetch(config.TICKET_CATEGORY_ID);
+    const channel = await guild.channels.create(`ticket-${creator.username}-${category}`, {
+      type: 'GUILD_TEXT',
+      parent: ticketCategory,
+      permissionOverwrites: overwrites
+    });
+
+    data.tickets[channel.id] = {
+      creator: creator.id,
+      status: 'open',
+      claimed_by: null,
+      category: category,
+      created_at: new Date().toISOString()
+    };
+    saveData();
+
+    const buttons = new MessageActionRow().addComponents(
+      new MessageButton()
+        .setCustomId('claim_ticket')
+        .setLabel('Claim Ticket')
+        .setStyle('SUCCESS'),
+      new MessageButton()
+        .setCustomId('close_ticket')
+        .setLabel('Close Ticket')
+        .setStyle('DANGER'),
+      new MessageButton()
+        .setCustomId('add_user')
+        .setLabel('Add User')
+        .setStyle('SUCCESS'),
+      new MessageButton()
+        .setCustomId('remove_user')
+        .setLabel('Remove User')
+        .setStyle('SECONDARY'),
+      new MessageButton()
+        .setCustomId('lock_ticket')
+        .setLabel('Lock Ticket')
+        .setStyle('PRIMARY')
+    );
+
+    await channel.send({
+      content: `${creator}, welcome to your ${TICKET_CATEGORIES[category]} ticket!\nPlease describe your issue, and a staff member will assist you shortly.`,
+      components: [buttons]
+    });
+
+    const logChannel = await guild.channels.fetch(config.LOG_CHANNEL_ID);
+    if (logChannel) {
+      await logChannel.send(`🎟️ Ticket created: ${channel} by ${creator} for ${TICKET_CATEGORIES[category]}.`);
+    }
+  } catch (error) {
+    console.error('Error creating ticket channel:', error);
+    await interaction.followUp({ content: "Failed to create ticket channel. Please try again.", ephemeral: true });
+  }
+}
+
+// Send ticket panel
+async function sendTicketPanel() {
+  try {
+    const guild = await client.guilds.fetch(config.GUILD_ID);
+    const channel = await guild.channels.fetch(config.CHANNEL_ID);
+
+    // Delete old panel if exists
+    if (data.panel_message_id) {
+      try {
+        const oldMessage = await channel.messages.fetch(data.panel_message_id);
+        await oldMessage.delete();
+      } catch (error) {
+        console.log('Could not delete old panel message');
+      }
+    }
+
+    // Create new panel
+    const embed = new MessageEmbed()
+      .setTitle("📩 Support Ticket Panel")
+      .setDescription("Welcome to the support ticket system! Please select a category below to create a ticket.")
+      .addField("Rules", "1. Be respectful\n2. Provide details\n3. No spam", false)
+      .addField("Categories", "🔹 Billing Support\n🔹 Technical Support\n🔹 General Inquiry", false)
+      .setColor('#0099ff');
+
+    if (guild.icon) {
+      embed.setThumbnail(guild.iconURL());
+    }
+
+    const selectMenu = new MessageActionRow().addComponents(
+      new MessageSelectMenu()
+        .setCustomId('ticket_select')
+        .setPlaceholder('Select a ticket category...')
+        .addOptions([
+          {
+            label: 'Billing Support',
+            description: 'Issues related to payments or billing',
+            value: 'billing'
+          },
+          {
+            label: 'Technical Support',
+            description: 'Technical issues or bugs',
+            value: 'technical'
+          },
+          {
+            label: 'General Inquiry',
+            description: 'General questions or inquiries',
+            value: 'general'
+          }
+        ])
+    );
+
+    const panelMessage = await channel.send({
+      embeds: [embed],
+      components: [selectMenu]
+    });
+
+    data.panel_message_id = panelMessage.id;
+    saveData();
+  } catch (error) {
+    console.error('Error sending ticket panel:', error);
+  }
+}
+
+// Restore ticket buttons
+async function restoreTicketButtons() {
+  for (const [channelId, ticketData] of Object.entries(data.tickets)) {
+    try {
+      if (ticketData.status === 'open') {
+        const channel = await client.channels.fetch(channelId);
+        if (channel) {
+          const messages = await channel.messages.fetch({ limit: 5 });
+          const botMessage = messages.find(m => m.author.id === client.user.id);
+          
+          if (botMessage && !botMessage.components.length) {
+            const buttons = new MessageActionRow().addComponents(
+              new MessageButton()
+                .setCustomId('claim_ticket')
+                .setLabel('Claim Ticket')
+                .setStyle('SUCCESS'),
+              new MessageButton()
+                .setCustomId('close_ticket')
+                .setLabel('Close Ticket')
+                .setStyle('DANGER'),
+              new MessageButton()
+                .setCustomId('add_user')
+                .setLabel('Add User')
+                .setStyle('SUCCESS'),
+              new MessageButton()
+                .setCustomId('remove_user')
+                .setLabel('Remove User')
+                .setStyle('SECONDARY'),
+              new MessageButton()
+                .setCustomId('lock_ticket')
+                .setLabel('Lock Ticket')
+                .setStyle('PRIMARY')
+            );
+            
+            await botMessage.edit({ components: [buttons] });
+          }
+        }
+      }
+    } catch (error) {
+      console.error(`Error restoring ticket ${channelId}:`, error);
+    }
+  }
+}
+
+// Clean closed tickets
+async function cleanClosedTickets() {
+  for (const [channelId, ticketData] of Object.entries(data.tickets)) {
+    if (ticketData.status === 'closed') {
+      try {
+        const channel = await client.channels.fetch(channelId);
+        if (channel) {
+          const createdDate = new Date(ticketData.created_at);
+          const daysOld = (new Date() - createdDate) / (1000 * 60 * 60 * 24);
+          
+          if (daysOld > 7) {
+            await channel.delete();
+            delete data.tickets[channelId];
+          }
+        }
+      } catch (error) {
+        console.error(`Error cleaning ticket ${channelId}:`, error);
+      }
+    }
+  }
+  saveData();
+}
+
+// Bot events
+client.on('ready', async () => {
+  console.log(`Logged in as ${client.user.tag}`);
+  
+  // Restore existing tickets
+  await restoreTicketButtons();
+  
+  // Send panel
+  await sendTicketPanel();
+  
+  // Start cleanup interval (every 24 hours)
+  setInterval(cleanClosedTickets, 24 * 60 * 60 * 1000);
+});
+
+// Interaction handling
+client.on('interactionCreate', async interaction => {
+  if (!interaction.isSelectMenu() && !interaction.isButton()) return;
+
+  try {
+    if (interaction.isSelectMenu() && interaction.customId === 'ticket_select') {
+      // Ticket category selection
+      await interaction.deferReply({ ephemeral: true });
+      
+      // Check cooldown
+      const cooldownKey = `${interaction.user.id}_ticket`;
+      const cooldownTime = 30 * 1000; // 30 seconds
+      
+      if (cooldowns.has(cooldownKey)) {
+        const remaining = (cooldowns.get(cooldownKey) + cooldownTime) - Date.now();
+        if (remaining > 0) {
+          const seconds = Math.ceil(remaining / 1000);
+          return interaction.followUp({
+            content: `You're creating tickets too fast! Please wait ${seconds} seconds.`,
+            ephemeral: true
+          });
+        }
+      }
+      
+      cooldowns.set(cooldownKey, Date.now());
+      
+      const category = interaction.values[0];
+      await interaction.followUp({
+        content: `Creating a ${TICKET_CATEGORIES[category]} ticket...`,
+        ephemeral: true
+      });
+      
+      // Reset the select menu
+      const newSelectMenu = new MessageActionRow().addComponents(
+        interaction.component.setPlaceholder('Select a ticket category...')
+      );
+      
+      await interaction.message.edit({ components: [newSelectMenu] });
+      
+      await createTicketChannel(interaction, category);
+    }
+    
+    if (interaction.isButton()) {
+      // Handle ticket buttons
+      await interaction.deferReply({ ephemeral: true });
+      
+      const channelId = interaction.channel.id;
+      const ticket = data.tickets[channelId];
+      
+      if (!ticket) {
+        return interaction.followUp({ content: "This doesn't appear to be a ticket channel.", ephemeral: true });
+      }
+      
+      const staffRole = await interaction.guild.roles.fetch(config.STAFF_ROLE_ID);
+      const isStaff = interaction.member.roles.cache.has(staffRole.id);
+      
+      switch (interaction.customId) {
+        case 'claim_ticket':
+          if (!isStaff) {
+            return interaction.followUp({ content: "You don't have permission to claim tickets.", ephemeral: true });
+          }
+          
+          if (ticket.claimed_by) {
+            return interaction.followUp({ content: "This ticket is already claimed.", ephemeral: true });
+          }
+          
+          const staffId = interaction.user.id;
+          data.staff_ratings[staffId] = (data.staff_ratings[staffId] || 0) + 1;
+          data.tickets[channelId].claimed_by = staffId;
+          saveData();
+          
+          await interaction.followUp({ content: `🎉 ${interaction.user} has claimed this ticket!` });
+          
+          // Get current rank
+          const sortedRatings = Object.entries(data.staff_ratings)
+            .sort((a, b) => b[1] - a[1]);
+          const rank = sortedRatings.findIndex(([id]) => id === staffId) + 1;
+          
+          let response = `⭐ ${interaction.user}'s rating is now ${data.staff_ratings[staffId]}`;
+          if (rank) response += ` (Rank #${rank})`;
+          
+          await interaction.channel.send(response);
+          
+          const logChannel = await interaction.guild.channels.fetch(config.LOG_CHANNEL_ID);
+          if (logChannel) {
+            await logChannel.send(`🎉 Ticket claimed: ${interaction.channel} by ${interaction.user}.`);
+          }
+          break;
+          
+        case 'close_ticket':
+          if (ticket.status === 'closed') {
+            return interaction.followUp({ content: "This ticket is already closed.", ephemeral: true });
+          }
+          
+          data.tickets[channelId].status = 'closed';
+          await interaction.channel.permissionOverwrites.edit(interaction.guild.id, {
+            VIEW_CHANNEL: false
+          });
+          saveData();
+          
+          await interaction.followUp({ content: "This ticket has been closed." });
+          
+          const deleteView = new MessageActionRow().addComponents(
+            new MessageButton()
+              .setCustomId('delete_ticket')
+              .setLabel('Delete Ticket')
+              .setStyle('DANGER')
+          );
+          
+          await interaction.followUp({
+            content: "Would you like to delete this ticket?",
+            components: [deleteView],
+            ephemeral: true
+          });
+          
+          const logChannel = await interaction.guild.channels.fetch(config.LOG_CHANNEL_ID);
+          if (logChannel) {
+            await logChannel.send(`🔒 Ticket closed: ${interaction.channel} by ${interaction.user}.`);
+          }
+          break;
+          
+        case 'delete_ticket':
+          await interaction.channel.delete();
+          delete data.tickets[channelId];
+          saveData();
+          break;
+          
+        case 'add_user':
+          await interaction.followUp({ content: "Please mention the user you want to add.", ephemeral: true });
+          
+          const addFilter = m => m.author.id === interaction.user.id && m.channel.id === interaction.channel.id;
+          const addCollector = interaction.channel.createMessageCollector({
+            filter: addFilter,
+            time: 30000,
+            max: 1
+          });
+          
+          addCollector.on('collect', async m => {
+            const user = m.mentions.users.first();
+            if (user) {
+              await interaction.channel.permissionOverwrites.edit(user.id, {
+                VIEW_CHANNEL: true,
+                SEND_MESSAGES: true
+              });
+              await interaction.channel.send(`${user} has been added to the ticket.`);
+              
+              const logChannel = await interaction.guild.channels.fetch(config.LOG_CHANNEL_ID);
+              if (logChannel) {
+                await logChannel.send(`👤 User added to ticket ${interaction.channel}: ${user}.`);
+              }
+            } else {
+              await interaction.channel.send("No user mentioned.");
+            }
+          });
+          
+          addCollector.on('end', () => {
+            if (addCollector.collected.size === 0) {
+              interaction.channel.send("Timed out waiting for user mention.");
+            }
+          });
+          break;
+          
+        case 'remove_user':
+          await interaction.followUp({ content: "Please mention the user you want to remove.", ephemeral: true });
+          
+          const removeFilter = m => m.author.id === interaction.user.id && m.channel.id === interaction.channel.id;
+          const removeCollector = interaction.channel.createMessageCollector({
+            filter: removeFilter,
+            time: 30000,
+            max: 1
+          });
+          
+          removeCollector.on('collect', async m => {
+            const user = m.mentions.users.first();
+            if (user) {
+              await interaction.channel.permissionOverwrites.edit(user.id, {
+                VIEW_CHANNEL: false
+              });
+              await interaction.channel.send(`${user} has been removed from the ticket.`);
+              
+              const logChannel = await interaction.guild.channels.fetch(config.LOG_CHANNEL_ID);
+              if (logChannel) {
+                await logChannel.send(`👤 User removed from ticket ${interaction.channel}: ${user}.`);
+              }
+            } else {
+              await interaction.channel.send("No user mentioned.");
+            }
+          });
+          
+          removeCollector.on('end', () => {
+            if (removeCollector.collected.size === 0) {
+              interaction.channel.send("Timed out waiting for user mention.");
+            }
+          });
+          break;
+          
+        case 'lock_ticket':
+          if (ticket.status === 'locked') {
+            return interaction.followUp({ content: "This ticket is already locked.", ephemeral: true });
+          }
+          
+          data.tickets[channelId].status = 'locked';
+          await interaction.channel.permissionOverwrites.edit(interaction.guild.id, {
+            SEND_MESSAGES: false
+          });
+          saveData();
+          
+          await interaction.followUp({ content: "This ticket has been locked." });
+          
+          const logChannel = await interaction.guild.channels.fetch(config.LOG_CHANNEL_ID);
+          if (logChannel) {
+            await logChannel.send(`🔐 Ticket locked: ${interaction.channel} by ${interaction.user}.`);
+          }
+          break;
+      }
+    }
+  } catch (error) {
+    console.error('Error handling interaction:', error);
+    if (interaction.deferred || interaction.replied) {
+      await interaction.followUp({ content: "An error occurred. Please try again.", ephemeral: true });
+    } else {
+      await interaction.reply({ content: "An error occurred. Please try again.", ephemeral: true });
+    }
+  }
+});
+
+// Slash commands
+client.on('interactionCreate', async interaction => {
+  if (!interaction.isCommand()) return;
+
+  try {
+    await interaction.deferReply({ ephemeral: true });
+    
+    const staffRole = await interaction.guild.roles.fetch(config.STAFF_ROLE_ID);
+    const isStaff = interaction.member.roles.cache.has(staffRole.id);
+    
+    if (!isStaff) {
+      return interaction.followUp({ content: "You don't have permission to use this command.", ephemeral: true });
+    }
+    
+    switch (interaction.commandName) {
+      case 'rating':
+        const rating = data.staff_ratings[interaction.user.id] || 0;
+        await interaction.followUp({ content: `⭐ Your rating: ${rating}`, ephemeral: true });
+        break;
+        
+      case 'checkrank':
+        const member = interaction.options.getMember('member');
+        if (!member) {
+          return interaction.followUp({ content: "Please specify a member to check.", ephemeral: true });
+        }
+        
+        const memberRating = data.staff_ratings[member.id] || 0;
+        const embed = new MessageEmbed()
+          .setTitle(`Staff Rating for ${member.displayName}`)
+          .setDescription(`⭐ **Ticket Rating:** ${memberRating}`)
+          .setThumbnail(member.displayAvatarURL())
+          .setColor('#FFD700');
+        
+        const sortedRatings = Object.entries(data.staff_ratings)
+          .sort((a, b) => b[1] - a[1]);
+        const rank = sortedRatings.findIndex(([id]) => id === member.id) + 1;
+        
+        if (rank > 0) {
+          embed.addField('Rank Position', `#${rank} out of ${sortedRatings.length} staff members`);
+        }
+        
+        await interaction.followUp({ embeds: [embed], ephemeral: true });
+        break;
+        
+      case 'rankleaderboard':
+        const sortedStaff = Object.entries(data.staff_ratings)
+          .sort((a, b) => b[1] - a[1])
+          .slice(0, 10);
+        
+        const leaderboardEmbed = new MessageEmbed()
+          .setTitle('🏆 Staff Ranking Leaderboard')
+          .setDescription('Top staff members based on ticket ratings')
+          .setColor('#FFD700');
+        
+        for (let i = 0; i < sortedStaff.length; i++) {
+          const [staffId, rating] = sortedStaff[i];
+          const staffMember = await interaction.guild.members.fetch(staffId);
+          if (staffMember) {
+            leaderboardEmbed.addField(
+              `${i + 1}. ${staffMember.displayName}`,
+              `⭐ Rating: ${rating} | Tickets: ${rating}`,
+              false
+            );
+          }
+        }
+        
+        const userRating = data.staff_ratings[interaction.user.id] || 0;
+        if (userRating > 0 && !sortedStaff.some(([id]) => id === interaction.user.id)) {
+          const userRank = Object.entries(data.staff_ratings)
+            .sort((a, b) => b[1] - a[1])
+            .findIndex(([id]) => id === interaction.user.id) + 1;
+          
+          leaderboardEmbed.addField(
+            `Your Position (#${userRank})`,
+            `⭐ Your rating: ${userRating}`,
+            false
+          );
+        }
+        
+        leaderboardEmbed.setFooter({ text: `Total Staff Members: ${Object.keys(data.staff_ratings).length}` });
+        await interaction.followUp({ embeds: [leaderboardEmbed], ephemeral: true });
+        break;
+        
+      case 'refreshpanel':
+        await sendTicketPanel();
+        await interaction.followUp({ content: "Ticket panel refreshed!", ephemeral: true });
+        break;
+    }
+  } catch (error) {
+    console.error('Error handling command:', error);
+    await interaction.followUp({ content: "An error occurred while processing your command.", ephemeral: true });
+  }
+});
+
+// Register slash commands
+client.on('ready', async () => {
+  try {
+    const guild = await client.guilds.fetch(config.GUILD_ID);
+    const commands = [
+      {
+        name: 'rating',
+        description: 'Check your staff rating'
+      },
+      {
+        name: 'checkrank',
+        description: 'Check a staff member\'s ticket rating',
+        options: [
+          {
+            name: 'member',
+            description: 'The staff member to check',
+            type: 'USER',
+            required: true
+          }
+        ]
+      },
+      {
+        name: 'rankleaderboard',
+        description: 'Show the staff ranking leaderboard'
+      },
+      {
+        name: 'refreshpanel',
+        description: 'Refresh the ticket panel (Admin only)'
+      }
+    ];
+    
+    await guild.commands.set(commands);
+    console.log('Slash commands registered');
+  } catch (error) {
+    console.error('Error registering commands:', error);
+  }
+});
+
+// Initialize
+loadData();
+client.login(config.TOKEN);
+
+// Vercel serverless function handler
+module.exports = (req, res) => {
+  res.status(200).send('Discord bot is running');
+};
